@@ -122,6 +122,54 @@ WHERE lower(ad_login) = ANY(%(logins)s)
 """
 
 
+    upsertAdKtalkMapping = """
+INSERT INTO trmetrics.availconf.ad_ktalk_user_map (
+    ad_login,
+    ad_first_name,
+    ad_last_name,
+    ad_display_name,
+    ad_title,
+    ad_active,
+    ktalk_mention_id,
+    ktalk_display_name,
+    ktalk_post,
+    ktalk_matched,
+    ktalk_deactivated,
+    last_sync_at,
+    updated_at
+)
+VALUES (
+    %(ad_login)s,
+    %(ad_first_name)s,
+    %(ad_last_name)s,
+    %(ad_display_name)s,
+    %(ad_title)s,
+    %(ad_active)s,
+    %(ktalk_mention_id)s,
+    %(ktalk_display_name)s,
+    %(ktalk_post)s,
+    %(ktalk_matched)s,
+    %(ktalk_deactivated)s,
+    %(last_sync_at)s,
+    %(updated_at)s
+)
+ON CONFLICT (ad_login)
+DO UPDATE SET
+    ad_first_name = EXCLUDED.ad_first_name,
+    ad_last_name = EXCLUDED.ad_last_name,
+    ad_display_name = EXCLUDED.ad_display_name,
+    ad_title = EXCLUDED.ad_title,
+    ad_active = EXCLUDED.ad_active,
+    ktalk_mention_id = EXCLUDED.ktalk_mention_id,
+    ktalk_display_name = EXCLUDED.ktalk_display_name,
+    ktalk_post = EXCLUDED.ktalk_post,
+    ktalk_matched = EXCLUDED.ktalk_matched,
+    ktalk_deactivated = EXCLUDED.ktalk_deactivated,
+    last_sync_at = EXCLUDED.last_sync_at,
+    updated_at = EXCLUDED.updated_at;
+"""
+
+
 # Конфигурация для idcheker/ad mapping синхронизации
 CONFIG = {
     # PostgreSQL

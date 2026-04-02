@@ -11,7 +11,7 @@ from typing import Any
 import requests
 
 import cnf
-from ad_mapping import get_mentions_map_from_ad_mapping
+from ad_mapping import get_mentions_map_from_ad_mapping, sync_ad_mentions
 
 logger = logging.getLogger("autoalerter")
 
@@ -249,8 +249,9 @@ def create_discussion(
         logger.warning("Failed to send first thread reply for event=1 thread_id=%s", event_id)
 
     if users:
-        mention_by_login = get_mentions_map_from_ad_mapping(users)
         normalized_logins = [_normalize_login(user) for user in users if str(user).strip()]
+        sync_ad_mentions(normalized_logins)
+        mention_by_login = get_mentions_map_from_ad_mapping(normalized_logins)
         if not mention_by_login:
             logger.warning("No mention_id from mapping table for recipients=%s", users)
             return event_id
