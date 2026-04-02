@@ -6,11 +6,12 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Any
 
 import requests
 
 import cnf
-from ad_mapping import get_mentions_from_ad_mapping
+from ad_mapping import get_mentions_map_from_ad_mapping
 
 logger = logging.getLogger("autoalerter")
 
@@ -47,18 +48,76 @@ def _normalize_mentions(users: list[str]) -> list[str]:
     return mentions
 
 
+def _normalize_login(value: str) -> str:
+    login = str(value).strip()
+    if login.startswith("@"):
+        login = login[1:]
+    if ":" in login:
+        login = login.split(":", 1)[0]
+    return login.strip().lower()
+
+
+def _display_name_from_login(login: str) -> str:
+    cleaned = _normalize_login(login)
+    parts = [part for part in re.split(r"[._-]+", cleaned) if part]
+    if len(parts) >= 2:
+        return f"{parts[0].capitalize()} {parts[1].capitalize()}"
+    if len(parts) == 1:
+        return parts[0].capitalize()
+    return cleaned
+
+
+def _bot_api_url(endpoint: str) -> str:
+    base = str(cnf.ktalkBaseURL).rstrip("/")
+    endpoint = endpoint.lstrip("/")
+    return f"{base}/_matrix/client/strangler/api/v1/bot/{cnf.ktalkJwtToken}/{endpoint}"
+
+
+def _bot_request(method: str, endpoint: str, **kwargs: Any) -> requests.Response:
+    url = _bot_api_url(endpoint)
+    logger.debug("KTalk Bot API request method=%s endpoint=%s", method, endpoint)
+    response = requests.request(method, url, verify=False, timeout=30, **kwargs)
+    return response
+
+
+def search_users_by_bearer(query: str, limit: int = 15) -> list[dict[str, Any]]:
+    """Search users in KTalk telemetry API with Bearer token (for AD mapping use-cases)."""
+    config = cnf.CONFIG
+    base_url = str(config.get("ktalk_base_url", "")).strip()
+    token = str(config.get("ktalk_bearer_token", "")).strip()
+    talk_host = str(config.get("ktalk_talk_host", "")).strip()
+    host = str(config.get("ktalk_host", "chat.ktalk.ru")).strip()
+
+    if not base_url or not token or not talk_host:
+        logger.warning("KTalk bearer search config is incomplete, skip query=%r", query)
+        return []
+
+    auth_header = token if token.lower().startswith("bearer ") else f"Bearer {token}"
+    headers = {
+        "accept": "application/json",
+        "authorization": auth_header,
+        "talk-host": talk_host,
+        "host": host,
+        "user-agent": "autoalerter/1.0",
+    }
+    params = {"query": query, "limit": int(limit)}
+    response = requests.get(base_url, headers=headers, params=params, verify=False, timeout=30)
+    if not response.ok:
+        logger.error("KTalk bearer search failed status=%s body=%s", response.status_code, response.text)
+        return []
+    payload = response.json()
+    items = payload.get("items", [])
+    return items if isinstance(items, list) else []
+
+
 def send_invite_to_discussion(room_id: str, thread_id: str, user_id: str) -> bool:
-    url = (
-        f"{cnf.ktalkBaseURL}/_matrix/client/strangler/api/v1/"
-        f"bot/{cnf.ktalkJwtToken}/invite_to_thread"
-    )
     payload = {
         "room_id": room_id,
         "thread_id": thread_id,
         "user_id": user_id,
     }
     logger.debug("Sending discussion invite room_id=%s thread_id=%s user_id=%s", room_id, thread_id, user_id)
-    response = requests.post(url, json=payload, verify=False, timeout=30)
+    response = _bot_request("POST", "invite_to_thread", json=payload)
     if not response.ok:
         logger.error(
             "Kontur Talk invite failed status=%s user_id=%s body=%s",
@@ -71,9 +130,8 @@ def send_invite_to_discussion(room_id: str, thread_id: str, user_id: str) -> boo
 
 
 def get_room_members(room_id: str) -> set[str]:
-    url = cnf.ktalkRoomMembersURL.format(cnf.ktalkJwtToken)
-    logger.debug("Loading room members room_id=%s url=%s", room_id, url)
-    response = requests.get(url, params={"room_id": room_id}, verify=False, timeout=30)
+    logger.debug("Loading room members room_id=%s", room_id)
+    response = _bot_request("GET", "get_room_members", params={"room_id": room_id})
     if not response.ok:
         logger.error("Failed to load room members status=%s body=%s", response.status_code, response.text)
         return set()
@@ -108,18 +166,20 @@ def send_to_ktalk_message(
     event: str,
     thread_id: str | None = None,
     mentions: list[str] | None = None,
+    message_format: str = "plain",
 ) -> str | None:
     logger.debug("Sending message to Kontur Talk room=%s thread_id=%r", discussion_id, thread_id)
+    if message_format not in {"plain", "html", "markdown"}:
+        raise ValueError(f"Unsupported ktalk message format: {message_format}")
     message_text = _event_message(event, text)
-    url = (
-        f"{cnf.ktalkBaseURL}/_matrix/client/strangler/api/v1/"
-        f"bot/{cnf.ktalkJwtToken}/send_message"
-    )
     final_text = f"{trigger_time} {message_text}".strip()
+    if len(final_text) > 4096:
+        logger.error("KTalk message exceeds 4096 chars len=%s", len(final_text))
+        return None
     payload = {
         "room_id": discussion_id,
         "thread_id": thread_id,
-        "format": "plain",
+        "format": message_format,
         "message": final_text,
         "mentions": mentions or [],
     }
@@ -128,14 +188,9 @@ def send_to_ktalk_message(
         cnf.ktalkBaseURL,
         discussion_id,
         cnf.ktalkBotUser,
-        url,
+        _bot_api_url("send_message"),
     )
-    response = requests.post(
-        url,
-        json=payload,
-        verify=False,
-        timeout=30,
-    )
+    response = _bot_request("POST", "send_message", json=payload)
     success = response.ok
     if not success:
         logger.error("Kontur Talk send failed status=%s body=%s", response.status_code, response.text)
@@ -194,33 +249,39 @@ def create_discussion(
         logger.warning("Failed to send first thread reply for event=1 thread_id=%s", event_id)
 
     if users:
-        mentions = _normalize_mentions(get_mentions_from_ad_mapping(users))
-        if not mentions:
-            logger.warning("No mention_id from mapping table. Fallback to login-based mentions recipients=%s", users)
-            mentions = _normalize_mentions(users)
-        if not mentions:
-            logger.warning("No valid users for invites recipients=%s", users)
+        mention_by_login = get_mentions_map_from_ad_mapping(users)
+        normalized_logins = [_normalize_login(user) for user in users if str(user).strip()]
+        if not mention_by_login:
+            logger.warning("No mention_id from mapping table for recipients=%s", users)
             return event_id
 
         room_members = get_room_members(room_id)
         failed_invites: list[str] = []
 
-        for user_id in mentions:
-            if user_id in room_members:
-                mention_event_id = send_to_ktalk_message(
-                    "Упоминаю ответственного пользователя",
-                    "",
-                    room_id,
-                    event="1",
-                    thread_id=event_id,
-                    mentions=[user_id],
-                )
-                if not mention_event_id:
-                    logger.warning("Failed to mention user=%s in thread_id=%s", user_id, event_id)
+        for login in normalized_logins:
+            user_id = mention_by_login.get(login)
+            mention_candidates = _normalize_mentions([user_id] if user_id else [])
+            if not mention_candidates:
+                logger.warning("No valid mention_id for login=%s", login)
                 continue
 
-            if not send_invite_to_discussion(room_id, event_id, user_id):
-                failed_invites.append(user_id)
+            mention = mention_candidates[0]
+            if mention not in room_members:
+                if not send_invite_to_discussion(room_id, event_id, mention):
+                    failed_invites.append(mention)
+
+            mention_text = f"{_display_name_from_login(login)} {mention}"
+            mention_event_id = send_to_ktalk_message(
+                mention_text,
+                "",
+                room_id,
+                event="1",
+                thread_id=event_id,
+                mentions=[mention],
+                message_format="plain",
+            )
+            if not mention_event_id:
+                logger.warning("Failed to mention user=%s in thread_id=%s", mention, event_id)
 
         if failed_invites:
             logger.warning("Failed to invite users to discussion: %s", failed_invites)

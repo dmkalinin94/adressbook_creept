@@ -43,12 +43,12 @@ def _normalize_logins(users: list[str]) -> list[str]:
     return logins
 
 
-def get_mentions_from_ad_mapping(users: list[str]) -> list[str]:
+def get_mentions_map_from_ad_mapping(users: list[str]) -> dict[str, str]:
     logins = _normalize_logins(users)
     if not logins:
-        return []
+        return {}
 
-    logger.debug("Resolving mention_id from DB mapping for logins=%s", logins)
+    logger.debug("Resolving mention_id map from DB mapping for logins=%s", logins)
     with _db_connect() as conn, conn.cursor() as cur:
         cur.execute(cnf.query.getMentionIdsByAdLogins, {"logins": logins})
         rows = cur.fetchall()
@@ -58,6 +58,17 @@ def get_mentions_from_ad_mapping(users: list[str]) -> list[str]:
         for row in rows
         if row and row[1]
     }
+    logger.debug(
+        "Resolved mention_id map count=%s requested=%s",
+        len(mention_by_login),
+        len(logins),
+    )
+    return mention_by_login
+
+
+def get_mentions_from_ad_mapping(users: list[str]) -> list[str]:
+    logins = _normalize_logins(users)
+    mention_by_login = get_mentions_map_from_ad_mapping(logins)
 
     mentions: list[str] = []
     for login in logins:
