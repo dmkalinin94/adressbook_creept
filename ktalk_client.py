@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -129,33 +131,56 @@ def send_invite_to_discussion(room_id: str, thread_id: str, user_id: str) -> boo
     return True
 
 
+def fetch_telemetry(auth_token: str, base_url: str) -> str:
+    try:
+        headers = {
+            "accept": "application/json",
+            "authorization": auth_token if auth_token.lower().startswith("bearer ") else f"Bearer {auth_token}",
+            "host": str(cnf.CONFIG.get("ktalk_host", "chat.ktalk.ru")).strip(),
+            "talk-host": str(cnf.CONFIG.get("ktalk_talk_host", "")).strip(),
+        }
+        response = requests.get(base_url, headers=headers, verify=False, timeout=30)
+        response.encoding = "utf-8"
+        if not response.ok:
+            logger.error("KTalk telemetry members request failed status=%s body=%s", response.status_code, response.text)
+            return "error"
+        return response.text
+    except Exception:  # noqa: BLE001
+        logger.exception("KTalk telemetry members request failed")
+        return "error"
+
+
 def get_room_members(room_id: str) -> set[str]:
-    logger.debug("Loading room members room_id=%s", room_id)
-    response = _bot_request("GET", "get_room_members", params={"room_id": room_id})
-    if not response.ok:
-        logger.error("Failed to load room members status=%s body=%s", response.status_code, response.text)
+    logger.debug("Loading room members via telemetry room_id=%s", room_id)
+    base = str(cnf.ktalkBaseURL).rstrip("/")
+    room_path = quote(room_id, safe="!:")
+    search_url = f"{base}/_matrix/client/v3/rooms/{room_path}/members"
+    auth_token = str(cnf.CONFIG.get("ktalk_bearer_token", "")).strip()
+    raw_payload = fetch_telemetry(auth_token, search_url)
+    if raw_payload == "error":
         return set()
 
-    payload = response.json()
+    try:
+        payload = json.loads(raw_payload)
+    except ValueError:
+        logger.error("Failed to parse room members JSON. payload=%s", raw_payload)
+        return set()
+
     members: set[str] = set()
+    chunk = payload.get("chunk", [])
+    if isinstance(chunk, list):
+        for item in chunk:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content", {})
+            membership = str(content.get("membership", "")).strip().lower()
+            if membership != "join":
+                continue
+            user_id = item.get("state_key") or item.get("user_id") or content.get("user_id")
+            if isinstance(user_id, str) and user_id:
+                members.add(user_id)
 
-    raw_members = payload.get("members", [])
-    if isinstance(raw_members, list):
-        for item in raw_members:
-            if isinstance(item, str):
-                members.add(item)
-            elif isinstance(item, dict):
-                user_id = item.get("user_id")
-                if isinstance(user_id, str):
-                    members.add(user_id)
-
-    joined = payload.get("joined")
-    if isinstance(joined, dict):
-        members.update(str(user_id) for user_id in joined.keys())
-    elif isinstance(joined, list):
-        members.update(str(user_id) for user_id in joined)
-
-    logger.debug("Room members loaded count=%s", len(members))
+    logger.debug("Room members loaded via telemetry count=%s", len(members))
     return members
 
 
