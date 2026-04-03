@@ -13,7 +13,7 @@ from urllib.parse import quote
 import requests
 
 import cnf
-from ad_mapping import get_mentions_map_from_ad_mapping, sync_ad_mentions
+from ad_mapping import get_recipient_profiles_from_ad_mapping, sync_ad_mentions
 
 logger = logging.getLogger("autoalerter")
 
@@ -192,11 +192,12 @@ def send_to_ktalk_message(
     thread_id: str | None = None,
     mentions: list[str] | None = None,
     message_format: str = "plain",
+    decorate_event: bool = True,
 ) -> str | None:
     logger.debug("Sending message to Kontur Talk room=%s thread_id=%r", discussion_id, thread_id)
     if message_format not in {"plain", "html", "markdown"}:
         raise ValueError(f"Unsupported ktalk message format: {message_format}")
-    message_text = _event_message(event, text)
+    message_text = _event_message(event, text) if decorate_event else text
     final_text = f"{trigger_time} {message_text}".strip()
     if len(final_text) > 4096:
         logger.error("KTalk message exceeds 4096 chars len=%s", len(final_text))
@@ -276,8 +277,8 @@ def create_discussion(
     if users:
         normalized_logins = [_normalize_login(user) for user in users if str(user).strip()]
         sync_ad_mentions(normalized_logins)
-        mention_by_login = get_mentions_map_from_ad_mapping(normalized_logins)
-        if not mention_by_login:
+        recipient_profiles = get_recipient_profiles_from_ad_mapping(normalized_logins)
+        if not recipient_profiles:
             logger.warning("No mention_id from mapping table for recipients=%s", users)
             return event_id
 
@@ -285,7 +286,8 @@ def create_discussion(
         failed_invites: list[str] = []
 
         for login in normalized_logins:
-            user_id = mention_by_login.get(login)
+            profile = recipient_profiles.get(login)
+            user_id = profile.get("mention_id") if profile else None
             mention_candidates = _normalize_mentions([user_id] if user_id else [])
             if not mention_candidates:
                 logger.warning("No valid mention_id for login=%s", login)
@@ -296,7 +298,8 @@ def create_discussion(
                 if not send_invite_to_discussion(room_id, event_id, mention):
                     failed_invites.append(mention)
 
-            mention_text = f"{_display_name_from_login(login)} {mention}"
+            full_name = (profile or {}).get("full_name", "").strip() or _display_name_from_login(login)
+            mention_text = f"{full_name} {mention}"
             mention_event_id = send_to_ktalk_message(
                 mention_text,
                 "",
@@ -305,6 +308,7 @@ def create_discussion(
                 thread_id=event_id,
                 mentions=[mention],
                 message_format="plain",
+                decorate_event=False,
             )
             if not mention_event_id:
                 logger.warning("Failed to mention user=%s in thread_id=%s", mention, event_id)

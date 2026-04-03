@@ -112,7 +112,10 @@ RETURNING event_balance;
 """
 
     getMentionIdsByAdLogins = """
-SELECT lower(ad_login) AS ad_login, ktalk_mention_id
+SELECT
+    lower(ad_login) AS ad_login,
+    ktalk_mention_id,
+    COALESCE(NULLIF(TRIM(ad_first_name || ' ' || ad_last_name), ''), NULLIF(TRIM(ad_display_name), '')) AS full_name
 FROM trmetrics.availconf.ad_ktalk_user_map
 WHERE lower(ad_login) = ANY(%(logins)s)
   AND ad_active = TRUE

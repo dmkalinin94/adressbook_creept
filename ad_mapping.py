@@ -276,6 +276,31 @@ def get_mentions_map_from_ad_mapping(users: list[str]) -> dict[str, str]:
     return mention_by_login
 
 
+def get_recipient_profiles_from_ad_mapping(users: list[str]) -> dict[str, dict[str, str]]:
+    logins = _normalize_logins(users)
+    if not logins:
+        return {}
+
+    with _db_connect() as conn, conn.cursor() as cur:
+        cur.execute(cnf.query.getMentionIdsByAdLogins, {"logins": logins})
+        rows = cur.fetchall()
+
+    profiles: dict[str, dict[str, str]] = {}
+    for row in rows:
+        if not row or not row[1]:
+            continue
+        login = str(row[0]).strip().lower()
+        mention_id = str(row[1]).strip()
+        full_name = str(row[2]).strip() if len(row) > 2 and row[2] else ""
+        profiles[login] = {
+            "mention_id": mention_id,
+            "full_name": full_name,
+        }
+
+    logger.debug("Resolved recipient profiles count=%s", len(profiles))
+    return profiles
+
+
 def get_mentions_from_ad_mapping(users: list[str]) -> list[str]:
     logins = _normalize_logins(users)
     mention_by_login = get_mentions_map_from_ad_mapping(logins)
