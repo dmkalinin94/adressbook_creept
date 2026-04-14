@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import requests
+from requests import RequestException
 
 import cnf
 from db import get_db_connection
@@ -42,6 +43,10 @@ class KTalkUser:
     display_name: str
     post: str
     deactivated: bool
+
+
+class KTalkUnavailableError(RuntimeError):
+    pass
 
 
 def _normalize_logins(users: list[str]) -> list[str]:
@@ -149,18 +154,28 @@ def _search_ktalk_users(query: str, limit: int = 15) -> list[KTalkUser]:
         "host": host,
         "user-agent": "autoalerter/1.0",
     }
-    response = requests.get(
-        base_url,
-        headers=headers,
-        params={"query": query, "limit": int(limit)},
-        verify=cnf.VERIFY_SSL,
-        timeout=cnf.REQUEST_TIMEOUT,
-    )
-    if not response.ok:
-        logger.error("KTalk bearer search failed query=%r status=%s", query, response.status_code)
-        return []
+    try:
+        response = requests.get(
+            base_url,
+            headers=headers,
+            params={"query": query, "limit": int(limit)},
+            verify=cnf.VERIFY_SSL,
+            timeout=cnf.REQUEST_TIMEOUT,
+        )
+    except RequestException as exc:
+        logger.exception("Kontur Talk request failed")
+        raise KTalkUnavailableError("Kontur Talk lookup failed") from exc
 
-    payload = response.json()
+    if not response.ok:
+        logger.error("Kontur Talk API non-OK status: %s", response.status_code)
+        raise KTalkUnavailableError("Kontur Talk lookup failed")
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        logger.exception("Kontur Talk response is not valid JSON")
+        raise KTalkUnavailableError("Kontur Talk lookup failed") from exc
+
     items = payload.get("items", [])
     if not isinstance(items, list):
         return []
@@ -250,7 +265,11 @@ def sync_ad_mentions(users: list[str]) -> None:
             continue
 
         try:
-            candidates = _search_ktalk_users(query=f"{ad_user.first_name} {ad_user.last_name}")
+            candidates = _search_ktalk_users(query=ad_user.login)
+        except KTalkUnavailableError as exc:
+            logger.warning("KTalk is temporarily unavailable for login=%s: %s", login, exc)
+            _upsert_mapping_row(login, ad_user, None, ad_active=True, matched=False)
+            continue
         except Exception as exc:  # noqa: BLE001
             logger.exception("KTalk search failed for login=%s: %s", login, exc)
             _upsert_mapping_row(login, ad_user, None, ad_active=True, matched=False)
