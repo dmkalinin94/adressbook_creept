@@ -40,6 +40,13 @@ FLAP_NIGHT_END_HOUR = 7
 FLAP_REOPEN_HOURS = 6
 TIMEZONE_NAME = "Europe/Moscow"
 
+MANDATORY_RECIPIENTS = (
+    "dm.kalinin",
+    "d.boyarchuk",
+    "t.sukhorukikh",
+    "dk.korolev",
+)
+
 SQL_GET_LAST_ROOM_ID = """
 SELECT r_discussion_id
 FROM trmetrics.availconf.conf

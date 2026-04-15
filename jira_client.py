@@ -52,7 +52,7 @@ def _get_json(
 
 def _extract_recipients_from_group_attributes(payload: list[dict[str, Any]]) -> list[str]:
     recipients: list[str] = []
-    mandatory_recipients = ["dm.kalinin", "d.boyarchuk", "t.sukhorukikh", "dk.korolev"]
+    mandatory_recipients = list(cnf.MANDATORY_RECIPIENTS)
 
     for item in payload:
         attr_id = item.get("objectTypeAttributeId")

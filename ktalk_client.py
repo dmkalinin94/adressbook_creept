@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -18,11 +19,28 @@ import cnf
 logger = logging.getLogger("autoalerter")
 
 
+@dataclass(slots=True)
+class ConfirmedRecipient:
+    login: str
+    full_name: str
+    mention_id: str
+
+
 def _load_ad_mapping_helpers() -> tuple[Any, Any] | None:
     try:
-        from ad_mapping import get_recipient_profiles_from_ad_mapping, sync_ad_mentions
+        from ad_mapping import (
+            find_ktalk_match_for_ad_user,
+            get_active_ad_users,
+            normalize_logins,
+            save_confirmed_mapping,
+        )
 
-        return get_recipient_profiles_from_ad_mapping, sync_ad_mentions
+        return (
+            normalize_logins,
+            get_active_ad_users,
+            find_ktalk_match_for_ad_user,
+            save_confirmed_mapping,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Cannot import ad_mapping helpers: %s", exc)
         return None
@@ -77,6 +95,173 @@ def _display_name_from_login(login: str) -> str:
     if len(parts) == 1:
         return parts[0].capitalize()
     return cleaned
+
+
+def _prepare_source_logins(users: list[str]) -> list[str]:
+    raw = [str(user).strip() for user in users if str(user).strip()]
+    logger.info("Recipients step1 source_count=%s", len(raw))
+    return raw
+
+
+def _merge_with_mandatory_logins(source_logins: list[str]) -> list[str]:
+    merged = list(source_logins)
+    added = 0
+    existing = {item.strip().lower() for item in source_logins}
+    for login in cnf.MANDATORY_RECIPIENTS:
+        normalized = str(login).strip().lower()
+        if normalized and normalized not in existing:
+            merged.append(normalized)
+            existing.add(normalized)
+            added += 1
+    logger.info("Recipients step2 mandatory_added=%s total_after_merge=%s", added, len(merged))
+    return merged
+
+
+def _build_confirmed_recipients(source_users: list[str]) -> list[ConfirmedRecipient]:
+    mapping_helpers = _load_ad_mapping_helpers()
+    if mapping_helpers is None:
+        logger.warning("AD mapping helpers are unavailable, confirmed recipients list is empty")
+        return []
+
+    normalize_logins, get_active_ad_users, find_ktalk_match_for_ad_user, save_confirmed_mapping = mapping_helpers
+
+    source_logins = _prepare_source_logins(source_users)
+    merged_logins = _merge_with_mandatory_logins(source_logins)
+    normalized_logins = normalize_logins(merged_logins)
+    logger.info("Recipients step2 normalized_deduplicated_count=%s", len(normalized_logins))
+
+    active_ad_users, rejected_by_ad = get_active_ad_users(normalized_logins)
+    logger.info(
+        "Recipients step3 ad_filtered_active=%s ad_rejected=%s",
+        len(active_ad_users),
+        len(rejected_by_ad),
+    )
+    for login, reason in sorted(rejected_by_ad.items()):
+        logger.info("Recipient filtered login=%s reason=%s", login, reason)
+
+    confirmed: list[ConfirmedRecipient] = []
+    ktalk_rejected = 0
+    for login, ad_user in active_ad_users.items():
+        match, reason = find_ktalk_match_for_ad_user(ad_user)
+        if match is None:
+            ktalk_rejected += 1
+            logger.info("Recipient filtered login=%s reason=%s", login, reason or "ktalk_not_found")
+            continue
+
+        mentions = _normalize_mentions([match.mention_id])
+        if not mentions:
+            ktalk_rejected += 1
+            logger.info("Recipient filtered login=%s reason=invalid_mention_id", login)
+            continue
+
+        mention_id = mentions[0]
+        full_name = f"{ad_user.first_name} {ad_user.last_name}".strip() or _display_name_from_login(login)
+        save_confirmed_mapping(login, ad_user, match)
+        confirmed.append(ConfirmedRecipient(login=login, full_name=full_name, mention_id=mention_id))
+
+    logger.info(
+        "Recipients step4 ktalk_filtered_confirmed=%s ktalk_rejected=%s",
+        len(confirmed),
+        ktalk_rejected,
+    )
+    logger.info("Recipients step5 final_confirmed_count=%s", len(confirmed))
+    return confirmed
+
+
+def _split_recipients_by_room_members(
+    recipients: list[ConfirmedRecipient],
+    room_members: set[str],
+) -> tuple[list[ConfirmedRecipient], list[ConfirmedRecipient]]:
+    in_room: list[ConfirmedRecipient] = []
+    out_of_room: list[ConfirmedRecipient] = []
+    for recipient in recipients:
+        if recipient.mention_id in room_members:
+            in_room.append(recipient)
+        else:
+            out_of_room.append(recipient)
+    logger.info(
+        "Recipients step6 room_members_split in_room=%s out_of_room=%s",
+        len(in_room),
+        len(out_of_room),
+    )
+    return in_room, out_of_room
+
+
+def _mention_recipients_in_thread(
+    recipients: list[ConfirmedRecipient],
+    room_id: str,
+    thread_event_id: str,
+    dry_run: bool,
+) -> int:
+    mentioned = 0
+    for recipient in recipients:
+        mention_text = f"{recipient.full_name} {recipient.mention_id}"
+        if dry_run:
+            debug_text = f"[DEBUG] Нужно упомянуть в треде: {recipient.full_name} {recipient.mention_id}"
+            event_id = send_to_ktalk_message(
+                debug_text,
+                "",
+                room_id,
+                event="1",
+                thread_id=thread_event_id,
+                mentions=[],
+                message_format="plain",
+                decorate_event=False,
+            )
+            if event_id:
+                mentioned += 1
+            continue
+
+        event_id = send_to_ktalk_message(
+            mention_text,
+            "",
+            room_id,
+            event="1",
+            thread_id=thread_event_id,
+            mentions=[recipient.mention_id],
+            message_format="plain",
+            decorate_event=False,
+        )
+        if event_id:
+            mentioned += 1
+        else:
+            logger.warning(
+                "KTalk mention failed room_id=%s thread_id=%s login=%s",
+                room_id,
+                thread_event_id,
+                recipient.login,
+            )
+    return mentioned
+
+
+def _invite_recipients_to_room(
+    recipients: list[ConfirmedRecipient],
+    room_id: str,
+    dry_run: bool,
+) -> int:
+    invited = 0
+    for recipient in recipients:
+        if dry_run:
+            debug_text = f"[DEBUG] Нужно пригласить в обсуждение: {recipient.full_name} {recipient.mention_id}"
+            event_id = send_to_ktalk_message(
+                debug_text,
+                "",
+                room_id,
+                event="1",
+                thread_id=None,
+                mentions=[],
+                message_format="plain",
+                decorate_event=False,
+            )
+            if event_id:
+                invited += 1
+            continue
+
+        if invite_user_by_bearer(room_id, recipient.mention_id):
+            invited += 1
+        else:
+            logger.warning("KTalk invite failed room_id=%s login=%s", room_id, recipient.login)
+    return invited
 
 
 def _bot_api_url(endpoint: str) -> str:
@@ -319,6 +504,10 @@ def create_discussion(
         full_name,
         trigger_name,
     )
+    confirmed_recipients = _build_confirmed_recipients(users)
+    room_members = get_room_members(room_id)
+    in_room, out_of_room = _split_recipients_by_room_members(confirmed_recipients, room_members)
+
     event_id = send_to_ktalk_message(first_message, "", room_id, event="1", thread_id=None)
     if not event_id:
         raise RuntimeError("Failed to send first incident message to Kontur Talk")
@@ -341,99 +530,16 @@ def create_discussion(
         logger.warning("Failed to send first thread reply for event=1 thread_id=%s", event_id)
 
     dry_run = _is_mentions_invites_dry_run()
-
-    if users:
-        normalized_logins = [_normalize_login(user) for user in users if str(user).strip()]
-        mapping_helpers = _load_ad_mapping_helpers()
-        if mapping_helpers is None:
-            logger.warning("AD mapping helpers are unavailable, skip mention mapping")
-            return event_id
-
-        get_recipient_profiles_from_ad_mapping, sync_ad_mentions = mapping_helpers
-        sync_ad_mentions(normalized_logins)
-        recipient_profiles = get_recipient_profiles_from_ad_mapping(normalized_logins)
-        if not recipient_profiles:
-            logger.warning("No mention_id from mapping table for recipients")
-            return event_id
-
-        room_members = get_room_members(room_id)
-
-        for login in normalized_logins:
-            profile = recipient_profiles.get(login)
-            user_id = profile.get("mention_id") if profile else None
-            mention_candidates = _normalize_mentions([user_id] if user_id else [])
-            if not mention_candidates:
-                logger.warning("No valid mention_id for login=%s", login)
-                continue
-
-            mention = mention_candidates[0]
-            logger.info("KTalk mention target resolved login=%s mention=%s", login, mention)
-            full_name = (profile or {}).get("full_name", "").strip() or _display_name_from_login(login)
-            mention_text = f"{full_name} {mention}"
-
-            if dry_run:
-                if mention not in room_members:
-                    debug_invite_text = f"[DEBUG] Нужно пригласить в обсуждение: {full_name} {mention}"
-                    logger.info("KTalk dry-run: invite skipped intentionally room_id=%s login=%s", room_id, login)
-                    debug_invite_event_id = send_to_ktalk_message(
-                        debug_invite_text,
-                        "",
-                        room_id,
-                        event="1",
-                        thread_id=None,
-                        mentions=[],
-                        message_format="plain",
-                        decorate_event=False,
-                    )
-                    if not debug_invite_event_id:
-                        logger.warning("KTalk dry-run invite debug message failed room_id=%s login=%s", room_id, login)
-
-                debug_mention_text = f"[DEBUG] Нужно упомянуть в треде: {full_name} {mention}"
-                logger.info("KTalk dry-run: mention sent as plain text without mentions API room_id=%s thread_id=%s login=%s", room_id, event_id, login)
-                debug_mention_event_id = send_to_ktalk_message(
-                    debug_mention_text,
-                    "",
-                    room_id,
-                    event="1",
-                    thread_id=event_id,
-                    mentions=[],
-                    message_format="plain",
-                    decorate_event=False,
-                )
-                if not debug_mention_event_id:
-                    logger.warning("KTalk dry-run mention debug message failed room_id=%s thread_id=%s login=%s", room_id, event_id, login)
-                continue
-
-            if mention not in room_members:
-                logger.info("User is not in room members, invite via bearer API room_id=%s login=%s", room_id, login)
-                invited = invite_user_by_bearer(room_id, mention)
-                if not invited:
-                    logger.warning("KTalk bearer invite failed room_id=%s login=%s", room_id, login)
-                else:
-                    logger.info("KTalk bearer invite success room_id=%s login=%s", room_id, login)
-
-            logger.info(
-                "KTalk mention send start room_id=%s thread_id=%s login=%s full_name=%s mention=%s",
-                room_id,
-                event_id,
-                login,
-                full_name,
-                mention,
-            )
-            mention_event_id = send_to_ktalk_message(
-                mention_text,
-                "",
-                room_id,
-                event="1",
-                thread_id=event_id,
-                mentions=[mention],
-                message_format="plain",
-                decorate_event=False,
-            )
-            if not mention_event_id:
-                logger.warning("KTalk mention failed room_id=%s thread_id=%s login=%s", room_id, event_id, login)
-            else:
-                logger.info("KTalk mention success room_id=%s thread_id=%s login=%s event_id=%s", room_id, event_id, login, mention_event_id)
+    mentioned_count = _mention_recipients_in_thread(in_room, room_id, event_id, dry_run=dry_run)
+    invited_count = _invite_recipients_to_room(out_of_room, room_id, dry_run=dry_run)
+    logger.info(
+        "Recipients step7 result confirmed=%s in_room=%s mentioned=%s out_of_room=%s invited=%s",
+        len(confirmed_recipients),
+        len(in_room),
+        mentioned_count,
+        len(out_of_room),
+        invited_count,
+    )
 
     return event_id
 

@@ -66,6 +66,11 @@ def _normalize_logins(users: list[str]) -> list[str]:
     return logins
 
 
+def normalize_logins(users: list[str]) -> list[str]:
+    """Public wrapper used by user-processing flow in ktalk_client."""
+    return _normalize_logins(users)
+
+
 def _normalize(value: str) -> str:
     value = (value or "").strip().lower()
     value = re.sub(r"\s+", " ", value)
@@ -329,6 +334,69 @@ def sync_ad_mentions(users: list[str]) -> None:
             logger.info("Mapping row does not exist for login=%s, creating it", login)
 
         _upsert_mapping_row(login, ad_user, matched, ad_active=True, matched=True)
+
+
+def get_active_ad_users(logins: list[str]) -> tuple[dict[str, ADUser], dict[str, str]]:
+    """
+    Return only active AD users and per-login rejection reasons:
+    - ad_not_found
+    - ad_inactive
+    - ad_lookup_error
+    """
+    normalized = _normalize_logins(logins)
+    if not normalized:
+        return {}, {}
+
+    try:
+        fetched = _fetch_ad_users(normalized)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("AD batch lookup failed for count=%s: %s", len(normalized), exc)
+        return {}, {login: "ad_lookup_error" for login in normalized}
+
+    active_users: dict[str, ADUser] = {}
+    rejected: dict[str, str] = {}
+    for login in normalized:
+        ad_user = fetched.get(login)
+        if ad_user is None:
+            rejected[login] = "ad_not_found"
+            continue
+        if not ad_user.active:
+            rejected[login] = "ad_inactive"
+            continue
+        active_users[login] = ad_user
+
+    return active_users, rejected
+
+
+def find_ktalk_match_for_ad_user(ad_user: ADUser) -> tuple[KTalkUser | None, str | None]:
+    """
+    Resolve KTalk user for AD user.
+    Returns (match, rejection_reason) where rejection_reason is:
+    - ktalk_unavailable
+    - ktalk_not_found
+    """
+    try:
+        candidates = _search_ktalk_users(query=ad_user.login)
+    except KTalkUnavailableError:
+        return None, "ktalk_unavailable"
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("KTalk search failed for login=%s: %s", ad_user.login, exc)
+        return None, "ktalk_unavailable"
+
+    matched = _match_ktalk_user(ad_user, candidates)
+    if matched is None:
+        return None, "ktalk_not_found"
+    return matched, None
+
+
+def save_confirmed_mapping(login: str, ad_user: ADUser, ktalk_user: KTalkUser) -> None:
+    """Persist only fully confirmed AD+KTalk mapping."""
+    field_status = _required_field_status(login, ad_user, ktalk_user)
+    if not all(field_status.values()):
+        _log_missing_required_fields(login, field_status)
+        _delete_mapping_row(login)
+        return
+    _upsert_mapping_row(login, ad_user, ktalk_user, ad_active=True, matched=True)
 
 
 def get_mentions_map_from_ad_mapping(users: list[str]) -> dict[str, str]:
