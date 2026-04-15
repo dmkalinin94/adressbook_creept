@@ -139,7 +139,7 @@ def _fetch_ad_users(logins: list[str]) -> dict[str, ADUser | None]:
 
 
 def _search_ktalk_users(query: str, limit: int = 15) -> list[KTalkUser]:
-    base_url = str(cnf.KTALK_BEARER_SEARCH_URL).strip()
+    base_url = f"{str(cnf.KTALK_BASE_URL).rstrip('/')}/_matrix/client/read/api/v2/search/users"
     talk_host = str(cnf.KTALK_TALK_HOST).strip()
     host = str(cnf.KTALK_HOST).strip()
     bearer = _build_ktalk_bearer()

@@ -107,7 +107,7 @@ def _bot_request(method: str, endpoint: str, **kwargs: Any) -> requests.Response
 
 def search_users_by_bearer(query: str, limit: int = 15) -> list[dict[str, Any]]:
     """Search users in KTalk telemetry API with Bearer token (for AD mapping use-cases)."""
-    base_url = str(cnf.KTALK_BEARER_SEARCH_URL).strip()
+    base_url = f"{str(cnf.KTALK_BASE_URL).rstrip('/')}/_matrix/client/read/api/v2/search/users"
     token = str(cnf.KTALK_BEARER_TOKEN).strip()
     talk_host = str(cnf.KTALK_TALK_HOST).strip()
     host = str(cnf.KTALK_HOST).strip()
