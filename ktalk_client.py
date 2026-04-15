@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -264,10 +265,27 @@ def send_to_ktalk_message(
         cnf.KTALK_BOT_USER,
         _safe_bot_endpoint("send_message"),
     )
-    response = _bot_request("POST", "send_message", json=payload)
-    success = response.ok
-    if not success:
-        logger.error("Kontur Talk send failed status=%s", response.status_code)
+    retries = max(int(cnf.KTALK_SEND_RETRIES), 1)
+    retry_delay = float(cnf.KTALK_SEND_RETRY_DELAY_SEC)
+    response: requests.Response | None = None
+
+    for attempt in range(1, retries + 1):
+        response = _bot_request("POST", "send_message", json=payload)
+        if response.ok:
+            break
+        logger.warning(
+            "Kontur Talk send attempt failed status=%s attempt=%s/%s",
+            response.status_code,
+            attempt,
+            retries,
+        )
+        if response.status_code < 500 or attempt == retries:
+            break
+        time.sleep(retry_delay)
+
+    if response is None or not response.ok:
+        status = response.status_code if response is not None else "n/a"
+        logger.error("Kontur Talk send failed status=%s", status)
         return None
 
     try:

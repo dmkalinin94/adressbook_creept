@@ -23,6 +23,8 @@ KTALK_BEARER_SEARCH_URL = "https://chat.ktalk.ru/api/..."
 KTALK_BEARER_TOKEN = "change_me"
 KTALK_HOST = "chat.ktalk.ru"
 KTALK_TALK_HOST = "https://samoletgroup.ktalk.ru"
+KTALK_SEND_RETRIES = 3
+KTALK_SEND_RETRY_DELAY_SEC = 1.5
 
 AD_HOST = "ad.example.local"
 AD_USER = "EXAMPLE\\svc_account"
