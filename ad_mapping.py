@@ -250,6 +250,14 @@ def _mapping_row_exists(ad_login: str) -> bool:
         return cur.fetchone() is not None
 
 
+def _delete_mapping_row(ad_login: str) -> None:
+    with get_db_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM trmetrics.availconf.ad_ktalk_user_map WHERE ad_login = %s",
+            (ad_login,),
+        )
+
+
 def _required_field_status(ad_login: str, ad_user: ADUser | None, ktalk_user: KTalkUser | None) -> dict[str, bool]:
     return {
         "ad_login": bool(str(ad_login).strip()),
@@ -288,11 +296,13 @@ def sync_ad_mentions(users: list[str]) -> None:
 
         if ad_user is None:
             _log_missing_required_fields(login, _required_field_status(login, None, None))
+            _delete_mapping_row(login)
             continue
 
         if not ad_user.active:
             logger.warning("Skip DB write for login=%s: AD user is inactive", login)
             _log_missing_required_fields(login, _required_field_status(login, ad_user, None))
+            _delete_mapping_row(login)
             continue
 
         try:
@@ -300,16 +310,19 @@ def sync_ad_mentions(users: list[str]) -> None:
         except KTalkUnavailableError as exc:
             logger.warning("KTalk is temporarily unavailable for login=%s: %s", login, exc)
             _log_missing_required_fields(login, _required_field_status(login, ad_user, None))
+            _delete_mapping_row(login)
             continue
         except Exception as exc:  # noqa: BLE001
             logger.exception("KTalk search failed for login=%s: %s", login, exc)
             _log_missing_required_fields(login, _required_field_status(login, ad_user, None))
+            _delete_mapping_row(login)
             continue
 
         matched = _match_ktalk_user(ad_user, candidates)
         field_status = _required_field_status(login, ad_user, matched)
         if not all(field_status.values()):
             _log_missing_required_fields(login, field_status)
+            _delete_mapping_row(login)
             continue
 
         if not _mapping_row_exists(login):
