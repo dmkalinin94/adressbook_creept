@@ -241,6 +241,36 @@ def _upsert_mapping_row(
         cur.execute(cnf.SQL_UPSERT_AD_KTALK_MAPPING, values)
 
 
+def _mapping_row_exists(ad_login: str) -> bool:
+    with get_db_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM trmetrics.availconf.ad_ktalk_user_map WHERE ad_login = %s LIMIT 1",
+            (ad_login,),
+        )
+        return cur.fetchone() is not None
+
+
+def _required_field_status(ad_login: str, ad_user: ADUser | None, ktalk_user: KTalkUser | None) -> dict[str, bool]:
+    return {
+        "ad_login": bool(str(ad_login).strip()),
+        "ad_first_name": bool(ad_user and str(ad_user.first_name).strip()),
+        "ad_last_name": bool(ad_user and str(ad_user.last_name).strip()),
+        "ad_title": bool(ad_user and str(ad_user.title).strip()),
+        "ktalk_mention_id": bool(ktalk_user and str(ktalk_user.mention_id).strip()),
+        "ktalk_post": bool(ktalk_user and str(ktalk_user.post).strip()),
+    }
+
+
+def _log_missing_required_fields(ad_login: str, field_status: dict[str, bool]) -> None:
+    missing = [name for name, ok in field_status.items() if not ok]
+    if missing:
+        logger.warning(
+            "Skip DB write for login=%s: required fields missing=%s",
+            ad_login,
+            ",".join(missing),
+        )
+
+
 def sync_ad_mentions(users: list[str]) -> None:
     """Resolve AD users and KTalk mention IDs, then upsert mapping table."""
     logins = _normalize_logins(users)
@@ -257,26 +287,35 @@ def sync_ad_mentions(users: list[str]) -> None:
         ad_user = ad_users.get(login)
 
         if ad_user is None:
-            _upsert_mapping_row(login, None, None, ad_active=False, matched=False)
+            _log_missing_required_fields(login, _required_field_status(login, None, None))
             continue
 
         if not ad_user.active:
-            _upsert_mapping_row(login, ad_user, None, ad_active=False, matched=False)
+            logger.warning("Skip DB write for login=%s: AD user is inactive", login)
+            _log_missing_required_fields(login, _required_field_status(login, ad_user, None))
             continue
 
         try:
             candidates = _search_ktalk_users(query=ad_user.login)
         except KTalkUnavailableError as exc:
             logger.warning("KTalk is temporarily unavailable for login=%s: %s", login, exc)
-            _upsert_mapping_row(login, ad_user, None, ad_active=True, matched=False)
+            _log_missing_required_fields(login, _required_field_status(login, ad_user, None))
             continue
         except Exception as exc:  # noqa: BLE001
             logger.exception("KTalk search failed for login=%s: %s", login, exc)
-            _upsert_mapping_row(login, ad_user, None, ad_active=True, matched=False)
+            _log_missing_required_fields(login, _required_field_status(login, ad_user, None))
             continue
 
         matched = _match_ktalk_user(ad_user, candidates)
-        _upsert_mapping_row(login, ad_user, matched, ad_active=True, matched=matched is not None)
+        field_status = _required_field_status(login, ad_user, matched)
+        if not all(field_status.values()):
+            _log_missing_required_fields(login, field_status)
+            continue
+
+        if not _mapping_row_exists(login):
+            logger.info("Mapping row does not exist for login=%s, creating it", login)
+
+        _upsert_mapping_row(login, ad_user, matched, ad_active=True, matched=True)
 
 
 def get_mentions_map_from_ad_mapping(users: list[str]) -> dict[str, str]:
